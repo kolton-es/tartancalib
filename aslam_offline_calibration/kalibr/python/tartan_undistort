@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+"""Undistort images to a pinhole camera that holds the entire field of view.
+
+The calibrated camera (any model in a camchain yaml) is resampled into one
+ideal pinhole image. The pinhole focal length defaults to the calibrated one
+and the canvas is sized so every pixel of the original image fits; rays more
+than --max-angle from the optical axis cannot be shown by any pinhole camera
+and are left out.
+"""
+import argparse
+import math
+import os
+import sys
+
+import cv2
+import numpy as np
+import yaml
+
+import kalibr_common as kc
+
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+INTERPOLATION_TOLERANCE_PX = 0.05
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--cam', dest='chain_yaml', required=True,
+                        help='Calibration result (camchain yaml), e.g. log1-camchain.yaml.')
+    parser.add_argument('--cam-id', type=int, default=0,
+                        help='Camera index in the camchain (default: %(default)s).')
+    parser.add_argument('--images', nargs='+', required=True,
+                        help='Image files and/or folders of images to undistort.')
+    parser.add_argument('--out', help='Folder to save <name>_pinhole.png and pinhole_camera.yaml in.')
+    parser.add_argument('--show', action='store_true',
+                        help='Show the images in a window (any key: next, p: previous, q/Esc: quit).')
+    parser.add_argument('--scale', type=float, default=1.0,
+                        help='Pinhole focal length as a multiple of the calibrated one (default: %(default)s).')
+    parser.add_argument('--max-size', type=int, default=4000,
+                        help='Shrink the focal length so the longer output side is at most this many '
+                             'pixels (default: %(default)s).')
+    parser.add_argument('--max-angle', type=float, default=85.0,
+                        help='Largest angle from the optical axis to include [deg], below 90 '
+                             '(default: %(default)s).')
+    parsed = parser.parse_args()
+    if not parsed.out and not parsed.show:
+        parser.error('nothing to do: pass --out and/or --show')
+    if not 0.0 < parsed.max_angle < 90.0:
+        parser.error('--max-angle must be between 0 and 90 degrees')
+    return parsed
+
+
+def list_images(paths):
+    images = []
+    for path in paths:
+        if os.path.isdir(path):
+            images += sorted(os.path.join(path, f) for f in os.listdir(path)
+                             if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
+        elif os.path.isfile(path):
+            images.append(path)
+        else:
+            sys.exit('No such image or folder: {0}'.format(path))
+    if not images:
+        sys.exit('No images found in {0}'.format(' '.join(paths)))
+    return images
+
+
+def border_pixels(width, height):
+    u = np.arange(width, dtype=float)
+    v = np.arange(height, dtype=float)
+    return np.vstack([
+        np.column_stack([u, np.zeros_like(u)]),
+        np.column_stack([u, np.full_like(u, height - 1)]),
+        np.column_stack([np.zeros_like(v), v]),
+        np.column_stack([np.full_like(v, width - 1), v]),
+    ])
+
+
+def pinhole_extent(geometry, width, height, max_angle):
+    """Bounding box of the image border on the z=1 plane, clamped at max_angle."""
+    tan_max = math.tan(math.radians(max_angle))
+    xs, ys, clamped = [], [], 0
+    for kp in border_pixels(width, height):
+        ray = np.asarray(geometry.keypointToEuclidean(kp)).ravel()
+        if not np.all(np.isfinite(ray)) or np.linalg.norm(ray) == 0:
+            continue
+        lateral = math.hypot(ray[0], ray[1])
+        if ray[2] <= 0 or lateral > tan_max * ray[2]:
+            # beyond max_angle: keep the direction, limit the angle
+            scale = tan_max / lateral
+            clamped += 1
+        else:
+            scale = 1.0 / ray[2]
+        xs.append(ray[0] * scale)
+        ys.append(ray[1] * scale)
+    if not xs:
+        sys.exit('Could not back-project the image border with this calibration.')
+    return min(xs), max(xs), min(ys), max(ys), clamped
+
+
+def project(geometry, rays, tan_max):
+    """Calibrated-camera pixel for each ray; NaN beyond tan_max from the axis.
+
+    Pixels outside the source image are kept (they interpolate smoothly and
+    resample to black), so the map does not lose a band at the image edge.
+    """
+    out = np.full((len(rays), 2), np.nan)
+    for k, ray in enumerate(rays):
+        if math.hypot(ray[0], ray[1]) > tan_max * ray[2]:
+            continue
+        kp = np.asarray(geometry.euclideanToKeypoint(ray)).ravel()[:2]
+        if np.all(np.isfinite(kp)):
+            out[k] = kp
+    return out
+
+
+class PinholeMap(object):
+    def __init__(self, geometry, width, height, fu, fv, x_range, y_range, max_angle):
+        self.fu, self.fv = fu, fv
+        self.cu, self.cv = -x_range[0] * fu, -y_range[0] * fv
+        self.width = int(math.ceil((x_range[1] - x_range[0]) * fu)) + 1
+        self.height = int(math.ceil((y_range[1] - y_range[0]) * fv)) + 1
+        self.geometry, self.src_size = geometry, (width, height)
+        self.tan_max = math.tan(math.radians(max_angle))
+
+        # Coarse grid through the calibrated model, bilinear in between; refine
+        # until the interpolation error is below tolerance.
+        for step in (8, 4, 2, 1):
+            self.map_x, self.map_y = self._build(step)
+            err = self._interpolation_error()
+            if err <= INTERPOLATION_TOLERANCE_PX:
+                break
+        self.step, self.max_interp_err = step, err
+
+    def _rays(self, us, vs):
+        return np.column_stack([(us - self.cu) / self.fu, (vs - self.cv) / self.fv, np.ones(len(us))])
+
+    def _build(self, step):
+        gu = np.arange(0, self.width + step, step, dtype=float)
+        gv = np.arange(0, self.height + step, step, dtype=float)
+        uu, vv = np.meshgrid(gu, gv)
+        kp = project(self.geometry, self._rays(uu.ravel(), vv.ravel()),
+                     self.tan_max).reshape(len(gv), len(gu), 2)
+        if step == 1:
+            full = kp[:self.height, :self.width]
+        else:
+            # remap the coarse grid onto output pixel coordinates (grid point k sits at k*step)
+            ou, ov = np.meshgrid(np.arange(self.width, dtype=np.float32) / step,
+                                 np.arange(self.height, dtype=np.float32) / step)
+            coarse = np.where(np.isnan(kp), -1e6, kp).astype(np.float32)
+            full = np.dstack([cv2.remap(coarse[:, :, c], ou, ov, cv2.INTER_LINEAR) for c in (0, 1)])
+            # neighbourhoods touching an invalid grid point are not trustworthy
+            invalid = np.isnan(kp[:, :, 0]).astype(np.float32)
+            touched = cv2.remap(invalid, ou, ov, cv2.INTER_LINEAR) > 0
+            full[touched] = -1.0
+        full = np.where(np.isnan(full), -1.0, full)
+        return full[:, :, 0].astype(np.float32), full[:, :, 1].astype(np.float32)
+
+    def _interpolation_error(self, samples=3000):
+        rng = np.random.RandomState(0)
+        us = rng.uniform(0, self.width - 1, samples)
+        vs = rng.uniform(0, self.height - 1, samples)
+        exact = project(self.geometry, self._rays(us, vs), self.tan_max)
+        interp = np.column_stack([
+            cv2.remap(self.map_x, us.astype(np.float32).reshape(1, -1), vs.astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR).ravel(),
+            cv2.remap(self.map_y, us.astype(np.float32).reshape(1, -1), vs.astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR).ravel()])
+        w, h = self.src_size
+        # only pixels that land inside the source image matter
+        ok = (~np.isnan(exact[:, 0]) & (interp[:, 0] > -1e5) &
+              (exact[:, 0] >= 0) & (exact[:, 0] <= w - 1) & (exact[:, 1] >= 0) & (exact[:, 1] <= h - 1))
+        if not np.any(ok):
+            return 0.0
+        return float(np.max(np.linalg.norm(exact[ok] - interp[ok], axis=1)))
+
+    def apply(self, image):
+        return cv2.remap(image, self.map_x, self.map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def main():
+    parsed = parse_arguments()
+    camchain = kc.ConfigReader.CameraChainParameters(parsed.chain_yaml)
+    params = camchain.getCameraParameters(parsed.cam_id)
+    camera_model, intrinsics = params.getIntrinsics()
+    dist_model, _ = params.getDistortion()
+    width, height = params.getResolution()
+    geometry = kc.AslamCamera.fromParameters(params).geometry
+    # Every supported model ends its intrinsics with fu, fv, pu, pv.
+    fu, fv = intrinsics[-4], intrinsics[-3]
+
+    xmin, xmax, ymin, ymax, clamped = pinhole_extent(geometry, width, height, parsed.max_angle)
+    scale = parsed.scale
+    longest = max((xmax - xmin) * fu, (ymax - ymin) * fv) * scale
+    if longest > parsed.max_size:
+        scale *= parsed.max_size / longest
+        print('Focal scale reduced to {0:.3f} to keep the output within {1} px (--max-size).'.format(
+            scale, parsed.max_size))
+    print('Building pinhole map for cam{0} ({1}-{2}, {3}x{4})...'.format(
+        parsed.cam_id, camera_model, dist_model, width, height))
+    pmap = PinholeMap(geometry, width, height, fu * scale, fv * scale, (xmin, xmax), (ymin, ymax),
+                      parsed.max_angle)
+
+    half_fov_x = (math.degrees(math.atan(-xmin)), math.degrees(math.atan(xmax)))
+    half_fov_y = (math.degrees(math.atan(-ymin)), math.degrees(math.atan(ymax)))
+    print('Pinhole output: {0}x{1} px, fu={2:.2f} fv={3:.2f} cu={4:.2f} cv={5:.2f}'.format(
+        pmap.width, pmap.height, pmap.fu, pmap.fv, pmap.cu, pmap.cv))
+    print('Field of view held: {0:.1f} deg horizontal ({1:.1f} left, {2:.1f} right), '
+          '{3:.1f} deg vertical ({4:.1f} up, {5:.1f} down)'.format(
+              sum(half_fov_x), half_fov_x[0], half_fov_x[1],
+              sum(half_fov_y), half_fov_y[0], half_fov_y[1]))
+    if clamped:
+        print('{0} border pixels lie beyond {1:g} deg from the optical axis and are not shown '
+              '(--max-angle).'.format(clamped, parsed.max_angle))
+    print('Map grid step {0} px, max interpolation error {1:.3f} px.'.format(pmap.step, pmap.max_interp_err))
+
+    if parsed.out:
+        if not os.path.isdir(parsed.out):
+            os.makedirs(parsed.out)
+        info = {
+            'source_camchain': os.path.abspath(parsed.chain_yaml),
+            'cam_id': parsed.cam_id,
+            'camera_model': 'pinhole',
+            'distortion_model': 'none',
+            'intrinsics': [float(pmap.fu), float(pmap.fv), float(pmap.cu), float(pmap.cv)],
+            'resolution': [pmap.width, pmap.height],
+            'max_angle_deg': parsed.max_angle,
+        }
+        with open(os.path.join(parsed.out, 'pinhole_camera.yaml'), 'w') as f:
+            yaml.safe_dump(info, f, default_flow_style=None, sort_keys=False)
+
+    images = list_images(parsed.images)
+    window = 'Pinhole (full field of view)'
+    if parsed.show:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        fit = min(1.0, 1000.0 / pmap.height, 1600.0 / pmap.width)
+        cv2.resizeWindow(window, int(pmap.width * fit), int(pmap.height * fit))
+
+    idx = 0
+    while 0 <= idx < len(images):
+        path = images[idx]
+        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            print('Skipping unreadable image {0}'.format(path))
+            idx += 1
+            continue
+        if image.shape[1] != width or image.shape[0] != height:
+            print('Skipping {0}: {1}x{2}, calibration is {3}x{4}'.format(
+                path, image.shape[1], image.shape[0], width, height))
+            idx += 1
+            continue
+        undistorted = pmap.apply(image)
+        if parsed.out:
+            name = os.path.splitext(os.path.basename(path))[0] + '_pinhole.png'
+            cv2.imwrite(os.path.join(parsed.out, name), undistorted)
+        if parsed.show:
+            cv2.setWindowTitle(window, '{0} [{1}/{2}]'.format(os.path.basename(path), idx + 1, len(images)))
+            cv2.imshow(window, undistorted)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord('q'), 27):
+                break
+            if key == ord('p'):
+                idx = max(0, idx - 1)
+                continue
+        idx += 1
+
+    if parsed.out:
+        print('Saved {0} image(s) and pinhole_camera.yaml to {1}'.format(
+            idx if parsed.show else len(images), parsed.out))
+    if parsed.show:
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()

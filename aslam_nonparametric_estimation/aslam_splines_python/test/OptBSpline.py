@@ -288,5 +288,5 @@ class TestOptBSpline(BSplineTestCase):
                         self.assertMatricesEqual(aspl.evalD(t,0),c,1e-15,"Error getting back the constant value")
 
 if __name__ == '__main__':
-    import rostest
-    rostest.rosrun('splines', 'optBSplines', TestOptBSpline)
+    import unittest
+    unittest.main()

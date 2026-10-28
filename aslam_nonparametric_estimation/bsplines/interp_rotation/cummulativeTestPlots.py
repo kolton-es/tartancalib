@@ -1,6 +1,3 @@
-import roslib
-roslib.load_manifest('bsplines')
-roslib.load_manifest('sm_python')
 import bsplines as asp
 import numpy as np
 import pylab as pl

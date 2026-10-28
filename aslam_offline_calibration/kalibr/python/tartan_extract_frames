@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+"""Cut a video into a tartan_calibrate image folder.
+
+Frames are sampled at --fps with ffmpeg's fps filter (frame k shows the video
+at k/fps seconds), converted to grey and written as <timestamp_ns>.png with
+timestamp = --start + k/fps. ffmpeg is used rather than OpenCV because
+OpenCV's frame times drift on variable-frame-rate recordings (e.g. RTSP
+captures), which picks frames other than the ones it labels. Decoding uses
+`-flags unaligned` so streams with a crop window (e.g. coded 896 px wide,
+displayed 800) are cropped exactly; older ffmpeg otherwise keeps part of the
+left crop for alignment and writes wider frames.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import cv2
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--video', required=True, help='Video file (anything ffmpeg reads).')
+    parser.add_argument('--out', required=True, help='Folder to write the frames to, e.g. dataset/cam0.')
+    parser.add_argument('--fps', type=float, default=4.0,
+                        help='Frames per second to keep (default: %(default)s).')
+    parser.add_argument('--start', type=int, default=1700000000,
+                        help='Timestamp of the first frame [s] (default: %(default)s).')
+    parsed = parser.parse_args()
+    if parsed.fps <= 0:
+        parser.error('--fps must be positive')
+    return parsed
+
+
+def display_size(video):
+    out = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                                   '-show_entries', 'stream=width,height', '-of', 'csv=p=0', video])
+    width, height = out.decode().strip().split(',')[:2]
+    return int(width), int(height)
+
+
+def main():
+    parsed = parse_arguments()
+    if not os.path.isfile(parsed.video):
+        sys.exit('No such video: {0}'.format(parsed.video))
+    if shutil.which('ffmpeg') is None:
+        sys.exit('ffmpeg is not installed')
+    if not os.path.isdir(parsed.out):
+        os.makedirs(parsed.out)
+
+    tmp = tempfile.mkdtemp(prefix='frames_', dir=parsed.out)
+    try:
+        subprocess.check_call(['ffmpeg', '-loglevel', 'error', '-flags', 'unaligned', '-i', parsed.video,
+                               '-vf', 'fps={0:g}'.format(parsed.fps), '-pix_fmt', 'gray',
+                               os.path.join(tmp, '%06d.png')])
+        frames = sorted(os.listdir(tmp))
+        if not frames:
+            sys.exit('No frames could be read from {0}'.format(parsed.video))
+        width, height = display_size(parsed.video)
+        frame = cv2.imread(os.path.join(tmp, frames[0]), cv2.IMREAD_GRAYSCALE)
+        if frame.shape != (height, width):
+            sys.exit('Extracted frames are {0}x{1} but the video displays {2}x{3}'.format(
+                frame.shape[1], frame.shape[0], width, height))
+        period_ns = 1e9 / parsed.fps
+        for k, name in enumerate(frames):
+            stamp_ns = parsed.start * 1000000000 + int(round(k * period_ns))
+            os.rename(os.path.join(tmp, name), os.path.join(parsed.out, '{0:d}.png'.format(stamp_ns)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('Extracted {0} frames at {1:g} fps into {2}'.format(len(frames), parsed.fps, parsed.out))
+
+
+if __name__ == '__main__':
+    main()

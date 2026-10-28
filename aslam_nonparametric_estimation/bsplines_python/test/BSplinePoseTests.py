@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-import roslib; roslib.load_manifest('bsplines');
-roslib.load_manifest('sm_python') 
 import bsplines
 import sm
 import numpy
@@ -218,6 +216,6 @@ class TestBSplinePose(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    import rostest
-    rostest.rosrun('splines', 'test_bspline_pose', TestBSplinePose)
+    import unittest
+    unittest.main()
 

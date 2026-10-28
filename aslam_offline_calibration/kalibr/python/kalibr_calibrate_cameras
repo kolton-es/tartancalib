@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 print("importing libraries")
-import rosbag
-import cv_bridge
 
 import sm
 from sm import PlotCollection
@@ -23,10 +21,11 @@ import signal
 
 np.set_printoptions(suppress=True)
 
-def initBagDataset(bagfile, topic, from_to):
-    print("\tDataset:          {0}".format(bagfile))
-    print("\tTopic:            {0}".format(topic))
-    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=from_to)
+def initFolderDataset(dataset_dir, cam, from_to):
+    """ Reads one camera's image folder into a reader and returns the reader."""
+    folder = os.path.join(dataset_dir, cam)
+    print("\tDataset:          {0}".format(folder))
+    reader = kc.FolderImageDatasetReader(folder, from_to=from_to)
     print("\tNumber of images: {0}".format(reader.numImages()))
     return reader
 
@@ -69,7 +68,7 @@ def parseArgs():
     cam1: pinhole model with equidistant distortion
     
     %(prog)s --models omni-radtan pinhole-equi --target aprilgrid.yaml \\
-              --bag MYROSBAG.bag --topics /cam0/image_raw /cam1/image_raw
+              --dataset MYDATASET --cams cam0 cam1
     
     example aprilgrid.yaml:
         target_type: 'aprilgrid'
@@ -82,9 +81,9 @@ def parseArgs():
     parser.add_argument('--models', nargs='+', dest='models', help='The camera model {0} to estimate'.format(list(cameraModels.keys())), required=True)
     
     groupSource = parser.add_argument_group('Data source')
-    groupSource.add_argument('--bag', dest='bagfile', help='The bag file with the data')
-    groupSource.add_argument('--topics', nargs='+', dest='topics', help='The list of image topics', required=True)
-    groupSource.add_argument('--bag-from-to', metavar='bag_from_to', type=float, nargs=2, help='Use the bag data starting from up to this time [s]')
+    groupSource.add_argument('--dataset', dest='datasetDir', help='Dataset folder with one subfolder of <timestamp_ns>.png images per camera', required=True)
+    groupSource.add_argument('--cams', nargs='+', dest='cams', help='The camera subfolders of --dataset to calibrate, e.g. cam0 cam1', required=True)
+    groupSource.add_argument('--from-to', metavar='from_to', dest='from_to', type=float, nargs=2, help='Use the data starting from up to this time [s]')
     
     groupTarget = parser.add_argument_group('Calibration target configuration')
     groupTarget.add_argument('--target', dest='targetYaml', help='Calibration target configuration as yaml file', required=True)
@@ -122,8 +121,8 @@ def parseArgs():
         sys.exit(2)
     
     #some checks
-    if len(parsed.topics) != len(parsed.models):
-        sm.logError("Please specify exactly one camera model (--models) for each topic (--topics).")
+    if len(parsed.cams) != len(parsed.models):
+        sm.logError("Please specify exactly one camera model (--models) for each camera (--cams).")
         sys.exit(2)
         
     if parsed.minViewOutlier<1:
@@ -154,19 +153,19 @@ def main():
 
     #create camera objects, initialize the intrinsics and extract targets
     cameraList = list()
-    numCams = len(parsed.topics)
+    numCams = len(parsed.cams)
 
     obsdb = kcc.ObservationDatabase(parsed.max_delta_approxsync)
         
     for cam_id in range(0, numCams):
-        topic = parsed.topics[cam_id]
+        topic = parsed.cams[cam_id]
         modelName = parsed.models[cam_id]
         print("Initializing cam{0}:".format(cam_id))
         print("\tCamera model:\t  {0}".format(modelName))
 
         if modelName in cameraModels:
             #open dataset 
-            dataset = initBagDataset(parsed.bagfile, topic, parsed.bag_from_to)
+            dataset = initFolderDataset(parsed.datasetDir, topic, parsed.from_to)
         
             #create camera
             cameraModel = cameraModels[modelName]
@@ -405,7 +404,7 @@ def main():
                 pl.show()
             
             #write to file
-            bagtag = os.path.splitext(parsed.bagfile)[0]
+            bagtag = os.path.normpath(parsed.datasetDir)
             resultFile = bagtag + "-camchain.yaml"
             kcc.saveChainParametersYaml(calibrator, resultFile, graph)
             print("Results written to file: {0}".format(resultFile))

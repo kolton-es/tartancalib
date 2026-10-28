@@ -49,5 +49,5 @@ class TestQuadraticIntegralError(unittest.TestCase):
             self.assertAlmostEqual(E, Epy, 3); 
 
 if __name__ == '__main__':
-    import rostest
-    rostest.rosrun('splines', 'QuadraticIntegralError', TestQuadraticIntegralError)
+    import unittest
+    unittest.main()

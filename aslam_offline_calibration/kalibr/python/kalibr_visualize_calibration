@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import kalibr_common as kc
+import matplotlib
 from mpl_toolkits.mplot3d import art3d, Axes3D, proj3d
 import numpy as np
 import pylab as pl
@@ -39,6 +40,15 @@ def parse_arguments():
         type=float,
         default=1e-4,
         required=False)
+    parser.add_argument(
+        '--out',
+        dest='out',
+        help='Save the figure to this file (png, pdf, ...).')
+    parser.add_argument(
+        '--no-show',
+        dest='no_show',
+        action='store_true',
+        help='Do not open a window (only useful with --out).')
     parsed_args = parser.parse_args()
     return parsed_args
 
@@ -52,7 +62,12 @@ def set_axis_equal_3d(ax):
     r = maxsize / 2
     for ctr, dim in zip(centers, 'xyz'):
         getattr(ax, 'set_{}lim'.format(dim))(ctr - r, ctr + r)
-    ax.set_aspect('equal')
+    try:
+        ax.set_aspect('equal')
+    except NotImplementedError:
+        # matplotlib < 3.3 cannot set a 3D aspect; the equal limits above
+        # already give a cube.
+        pass
 
 
 def set_orthogonal_projection(zfront, zback):
@@ -81,8 +96,10 @@ class CalibrationVisualization:
         self.scaling_factor = scaling_factor
 
     def add_camera_plot(self, transform, intrinsics, resolution):
-        focal_lengths = intrinsics[0:2]
-        principal_point = intrinsics[2:4]
+        # Every supported model (pinhole, omni, eucm, ds) ends its intrinsics
+        # with fu, fv, pu, pv.
+        focal_lengths = intrinsics[-4:-2]
+        principal_point = intrinsics[-2:]
         self.draw_camera_outline(transform, focal_lengths, principal_point,
                                  resolution)
         self.add_coordinate_frame_plot(transform)
@@ -91,11 +108,15 @@ class CalibrationVisualization:
         sm.plotCoordinateFrame(
             self.ax, transform.T(), size=3e2 * self.scaling_factor)
 
-    def show_plot(self, azim, elev):
+    def show_plot(self, azim, elev, out=None, show=True):
         self.ax.view_init(azim=azim, elev=elev)
         proj3d.persp_transformation = set_orthogonal_projection
         set_axis_equal_3d(self.ax)
-        pl.show()
+        if out:
+            self.fig.savefig(out, bbox_inches='tight')
+            print("Figure saved to {0}".format(out))
+        if show and matplotlib.get_backend().lower() != 'agg':
+            pl.show()
 
     def increment_color(self):
         self.color_counter += 1
@@ -127,14 +148,14 @@ class CalibrationVisualization:
             camera_corners[4, 0],
             camera_corners[4, 1],
             camera_corners[4, 2],
-            c=fill_color,
+            c=[fill_color],
             s=3e5 * self.scaling_factor)
         # Image plane corners.
         self.ax.scatter3D(
             camera_corners[:, 0],
             camera_corners[:, 1],
             camera_corners[:, 2],
-            c=fill_color,
+            c=[fill_color],
             s=1e5 * self.scaling_factor)
         # Planes of camera models.
         self.ax.add_collection3d(
@@ -177,7 +198,9 @@ def main():
             T_c0_cnm1 = T_c0_cn
         calibration_visualization.increment_color()
     calibration_visualization.show_plot(parsed_args.azim_view,
-                                        parsed_args.elev_view)
+                                        parsed_args.elev_view,
+                                        out=parsed_args.out,
+                                        show=not parsed_args.no_show)
 
 
 if __name__ == "__main__":

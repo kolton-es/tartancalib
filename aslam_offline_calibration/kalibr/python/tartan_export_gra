@@ -1,0 +1,231 @@
+#!/usr/bin/env python
+"""Export a calibration as a GRA camera-intrinsics role (gra.camera_intrinsics.v1).
+
+GRA's consumers take OpenCV fisheye (Kannala-Brandt k1..k4) intrinsics, so the
+calibrated model (any camchain model, e.g. ds-none) is converted: every
+--step-th pixel of the image is unprojected with the calibrated model and
+fx, fy, cx, cy, k1..k4 are fitted so that cv2.fisheye.projectPoints maps the
+rays back onto those pixels. fit_error_px reports how far the fit is from the
+calibration over the whole image and its outer 10% (like
+colmap-based-calibration's fisheye_intrinsics.fit_error). A pinhole-equi
+calibration is the same model and is copied exactly. Both use OpenCV's pixel
+convention (pixel centres at integers).
+
+With --gra-dir (GRA's configs/orins, bind-mounted), --host and --role the entry
+is written into <gra-dir>/camera-intrinsics/<host>.json: the role's intrinsics
+and provenance are replaced, its device fields (camera_type, camera_ip,
+board_id, serial_number, ...) are kept, other roles are untouched and
+updated_at is set. --dry-run shows the change without writing it.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+
+import kalibr_common as kc
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--cam', dest='chain_yaml', required=True, help='Calibration (camchain yaml).')
+    parser.add_argument('--cam-id', type=int, default=0, help='Camera index (default: %(default)s).')
+    parser.add_argument('--out', help='JSON file to also write the role entry to.')
+    parser.add_argument('--gra-dir', help="GRA's configs/orins folder (with camera-intrinsics/).")
+    parser.add_argument('--host', help='Vehicle whose camera-intrinsics/<host>.json to update.')
+    parser.add_argument('--role', help='Camera role to update, e.g. front_rgb.')
+    parser.add_argument('--dry-run', action='store_true', help='Show the GRA change without writing it.')
+    parser.add_argument('--source-file', help='Recording the calibration came from (recorded as source_file).')
+    parser.add_argument('--step', type=int, default=8, help='Pixel step of the fit grid (default: %(default)s).')
+    parser.add_argument('--max-fit-error', type=float, default=0.5,
+                        help='Fail if the fit is further than this from the calibration anywhere [px] '
+                             '(default: %(default)s).')
+    parsed = parser.parse_args()
+    if any((parsed.gra_dir, parsed.host, parsed.role)) and not all((parsed.gra_dir, parsed.host, parsed.role)):
+        parser.error('--gra-dir, --host and --role go together')
+    if parsed.role and not re.match(r'^[a-z0-9]+(_[a-z0-9]+)*$', parsed.role):
+        parser.error('--role {0!r} is not a GRA role name (e.g. front_rgb)'.format(parsed.role))
+    if not parsed.out and not parsed.gra_dir:
+        parser.error('nothing to do: pass --out and/or --gra-dir/--host/--role')
+    return parsed
+
+
+GRA_SCHEMA = 'gra.camera_intrinsics.v1'
+INTRINSIC_KEYS = ('model', 'width', 'height', 'fx', 'fy', 'cx', 'cy', 'distortion')
+# provenance of the previous calibration; replaced, not merged
+PROVENANCE_KEYS = ('source', 'source_file', 'source_sha256', 'note', 'captured_at', 'calibrated_at',
+                   'source_session', 'source_camera', 'optimize_center', 'fit_error_px')
+
+
+def describe(entry):
+    return '{0} {1}x{2} fx={3:.3f} fy={4:.3f} cx={5:.3f} cy={6:.3f} distortion={{{7}}}'.format(
+        entry.get('model'), entry.get('width'), entry.get('height'), entry.get('fx', float('nan')),
+        entry.get('fy', float('nan')), entry.get('cx', float('nan')), entry.get('cy', float('nan')),
+        ', '.join('{0}={1:.6g}'.format(n, v) for n, v in entry.get('distortion', {}).items()))
+
+
+def update_gra(entry, gra_dir, host, role, dry_run):
+    path = os.path.join(gra_dir, 'camera-intrinsics', '{0}.json'.format(host))
+    if not os.path.isfile(path):
+        known = sorted(f[:-5] for f in os.listdir(os.path.dirname(path)) if f.endswith('.json')) \
+            if os.path.isdir(os.path.dirname(path)) else []
+        sys.exit('{0} does not exist; check --host (known: {1})'.format(path, ', '.join(known) or 'none'))
+    with open(path) as f:
+        text = f.read()
+    document = json.loads(text)
+    if document.get('schema') != GRA_SCHEMA:
+        sys.exit('{0} is not {1}'.format(path, GRA_SCHEMA))
+
+    roles = document.setdefault('roles', {})
+    old = roles.get(role)
+    if old is not None and str(old.get('frame_flip', 0)).lower() not in ('0', 'none', 'false'):
+        sys.exit('{0} has frame_flip={1!r}: its intrinsics are in a flipped frame, the calibration is not'.format(
+            role, old['frame_flip']))
+    device = dict((k, v) for k, v in (old or {}).items() if k not in INTRINSIC_KEYS and k not in PROVENANCE_KEYS)
+    new = dict((k, entry[k]) for k in INTRINSIC_KEYS)
+    new.update(device)
+    new.update((k, entry[k]) for k in PROVENANCE_KEYS if k in entry)
+
+    print('GRA {0}: {1} {2}'.format(path, 'replacing' if old else 'adding', role))
+    if old:
+        print('  old: ' + describe(old))
+    print('  new: ' + describe(new))
+    if device:
+        print('  kept device fields: ' + ', '.join(sorted(device)))
+    warnings = []
+    if old and (old.get('width'), old.get('height')) != (new['width'], new['height']):
+        warnings.append('resolution changes from {0}x{1} to {2}x{3}; consumers sized for the old stream need '
+                        'the new one'.format(old.get('width'), old.get('height'), new['width'], new['height']))
+    extrinsics = os.path.join(gra_dir, 'camera-extrinsics', '{0}.json'.format(host))
+    if os.path.isfile(extrinsics):
+        with open(extrinsics) as f:
+            cameras = json.load(f).get('cameras', {})
+        for name, camera in cameras.items():
+            if camera.get('role') == role or name + '_rgb' == role:
+                for key in ('T_tof_cam', 'T_vehicle_cam'):
+                    if key in camera:
+                        warnings.append('{0} of camera {1!r} in camera-extrinsics/{2}.json was solved with the '
+                                        'previous intrinsics; re-solve it if the change matters'.format(
+                                            key, name, host))
+    if json.dumps(document, indent=2) + '\n' != text:
+        warnings.append('{0}.json is not in json.dump(indent=2) form, so the whole file is reformatted'.format(host))
+    for warning in warnings:
+        print('  warning: ' + warning)
+    if dry_run:
+        print('  dry run: nothing written')
+        return
+    roles[role] = new
+    document['updated_at'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    with open(path, 'w') as f:
+        f.write(json.dumps(document, indent=2) + '\n')
+    print('  written')
+
+
+def fisheye_project(params, rays):
+    fx, fy, cx, cy = params[:4]
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    D = np.asarray(params[4:8], dtype=np.float64).reshape(4, 1)
+    pts, _ = cv2.fisheye.projectPoints(rays.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, D)
+    return pts.reshape(-1, 2)
+
+
+def main():
+    parsed = parse_arguments()
+    camchain = kc.ConfigReader.CameraChainParameters(parsed.chain_yaml)
+    params = camchain.getCameraParameters(parsed.cam_id)
+    camera_model, intrinsics = params.getIntrinsics()
+    dist_model, dist_coeffs = params.getDistortion()
+    width, height = params.getResolution()
+    geometry = kc.AslamCamera.fromParameters(params).geometry
+    model_name = '{0}-{1}'.format(camera_model, dist_model)
+
+    # every step-th pixel, unprojected with the calibrated model
+    xs, ys = np.meshgrid(np.arange(0, width, parsed.step, dtype=float),
+                         np.arange(0, height, parsed.step, dtype=float))
+    pixels = np.column_stack([xs.ravel(), ys.ravel()])
+    rays = np.array([np.asarray(geometry.keypointToEuclidean(p)).ravel() for p in pixels])
+    ok = np.all(np.isfinite(rays), axis=1) & (np.linalg.norm(rays, axis=1) > 0)
+    if ok.mean() < 0.99:
+        sys.exit('{0:.1%} of the image could not be unprojected with the calibration'.format(1 - ok.mean()))
+    pixels, rays = pixels[ok], rays[ok] / np.linalg.norm(rays[ok], axis=1, keepdims=True)
+    theta = np.arccos(np.clip(rays[:, 2], -1.0, 1.0))
+
+    fu, fv, pu, pv = intrinsics[-4:]
+    if camera_model == 'pinhole' and dist_model == 'equidistant':
+        fitted = np.array([fu, fv, pu, pv] + list(dist_coeffs), dtype=float)
+        method = 'copied (pinhole-equidistant is OpenCV fisheye)'
+    else:
+        # equidistant focal length matching the calibration near the image centre
+        x0 = np.array([fu, fv, pu, pv, 0.0, 0.0, 0.0, 0.0], dtype=float)
+        sol = least_squares(lambda x: (fisheye_project(x, rays) - pixels).ravel(), x0,
+                            method='lm', x_scale='jac', max_nfev=5000)
+        if not sol.success:
+            sys.exit('Fisheye fit did not converge: {0}'.format(sol.message))
+        fitted = sol.x
+        method = 'fitted to {0} on every {1}th pixel'.format(model_name, parsed.step)
+
+    err = np.linalg.norm(fisheye_project(fitted, rays) - pixels, axis=1)
+    edge = np.minimum(np.minimum(pixels[:, 0], width - 1 - pixels[:, 0]) / float(width),
+                      np.minimum(pixels[:, 1], height - 1 - pixels[:, 1]) / float(height)) < 0.1
+    fit_error = {'rms': float(np.sqrt(np.mean(err ** 2))), 'max': float(err.max()),
+                 'edge_rms': float(np.sqrt(np.mean(err[edge] ** 2))), 'edge_max': float(err[edge].max())}
+
+    # the fitted radial mapping must keep increasing over the angles the image covers
+    k = fitted[4:8]
+    t = np.linspace(0.0, theta.max(), 2000)
+    theta_d = t * (1 + k[0] * t ** 2 + k[1] * t ** 4 + k[2] * t ** 6 + k[3] * t ** 8)
+    if np.any(np.diff(theta_d) <= 0):
+        sys.exit('The fitted fisheye model folds back within the image (theta up to {0:.1f} deg)'.format(
+            math.degrees(theta.max())))
+
+    print('Calibration {0}: {1}'.format(model_name, ', '.join('{0:.6g}'.format(v) for v in intrinsics)))
+    print('OpenCV fisheye ({0}): fx={1:.3f} fy={2:.3f} cx={3:.3f} cy={4:.3f} k={5}'.format(
+        method, fitted[0], fitted[1], fitted[2], fitted[3], ', '.join('{0:.6g}'.format(v) for v in k)))
+    print('Fit error vs calibration: RMS {rms:.4f}px, max {max:.4f}px; outer 10%: RMS {edge_rms:.4f}px, '
+          'max {edge_max:.4f}px'.format(**fit_error))
+    print('Image covers up to {0:.1f} deg from the optical axis.'.format(math.degrees(theta.max())))
+    if fit_error['max'] > parsed.max_fit_error:
+        sys.exit('Fit error {0:.3f}px exceeds --max-fit-error {1}px; not exporting.'.format(
+            fit_error['max'], parsed.max_fit_error))
+
+    with open(parsed.chain_yaml, 'rb') as f:
+        chain_sha = hashlib.sha256(f.read()).hexdigest()
+    entry = {
+        'model': 'opencv_fisheye',
+        'width': int(width),
+        'height': int(height),
+        'fx': float(fitted[0]),
+        'fy': float(fitted[1]),
+        'cx': float(fitted[2]),
+        'cy': float(fitted[3]),
+        'distortion': {'k1': float(k[0]), 'k2': float(k[1]), 'k3': float(k[2]), 'k4': float(k[3])},
+        'source': 'tartancalib',
+        'source_file': parsed.source_file or os.path.basename(parsed.chain_yaml),
+        'source_sha256': chain_sha,
+        'calibrated_at': datetime.datetime.utcfromtimestamp(os.path.getmtime(parsed.chain_yaml)).strftime(
+            '%Y-%m-%dT%H:%M:%SZ'),
+        'fit_error_px': fit_error,
+        'note': ('TartanCalib (Kalibr) {0} calibration of the camera\'s native frame ({1}x{2}), '
+                 'converted to OpenCV fisheye (Kannala-Brandt): {3}; integer pixel centres. '
+                 'source_sha256 is of the calibration camchain yaml.').format(
+                     model_name, int(width), int(height), method),
+    }
+    if parsed.out:
+        with open(parsed.out, 'w') as f:
+            json.dump(entry, f, indent=2)
+            f.write('\n')
+        print('Wrote {0}'.format(parsed.out))
+    if parsed.gra_dir:
+        update_gra(entry, parsed.gra_dir, parsed.host, parsed.role, parsed.dry_run)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,5 +1,3 @@
-import roslib
-roslib.load_manifest('splines')
 import asrl_splines as asp
 import numpy as np
 import pylab as pl

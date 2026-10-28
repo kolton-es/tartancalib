@@ -46,7 +46,10 @@ class CameraGeometry(object):
         self.isGeometryInitialized = False
         
         #create target detector
-        self.ctarget = TargetDetector(targetConfig, self.geometry, showCorners=verbose, showReproj=verbose)
+        # No reprojection window: both calibrators extract corners before any
+        # intrinsics exist (findTargetNoTransformation), which never draws it,
+        # so it only stayed black. tartan_reprojection shows it after calibration.
+        self.ctarget = TargetDetector(targetConfig, self.geometry, showCorners=verbose, showReproj=False)
 
     def setDvActiveStatus(self, projectionActive, distortionActive, shutterActice):
         self.dv.projectionDesignVariable().setActive(projectionActive)

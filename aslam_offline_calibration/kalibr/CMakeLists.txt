@@ -68,21 +68,19 @@ install(TARGETS ${${PROJECT_NAME}_TARGETS}
 
 catkin_install_python(
   PROGRAMS
-    python/kalibr_bagcreater
-    python/kalibr_camera_focus
-    python/kalibr_bagextractor
-    python/kalibr_camera_validator
     python/kalibr_visualize_calibration
     python/kalibr_calibrate_cameras
     python/tartan_calibrate
     python/tartan_visualize
+    python/tartan_undistort
+    python/tartan_reprojection
+    python/tartan_extract_frames
+    python/tartan_export_gra
     python/tartan_annotate
     python/tartan_polars
     python/tartan_polars_table
     python/tartan_analyze
     python/kalibr_visualize_distortion
-    python/kalibr_calibrate_imu_camera
     python/kalibr_create_target_pdf
-    python/kalibr_calibrate_rs_cameras
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

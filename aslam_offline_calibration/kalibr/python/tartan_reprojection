@@ -1,0 +1,250 @@
+#!/usr/bin/env python
+"""Overlay detected and reprojected target corners on the calibration frames.
+
+For every frame in a tartan_calibrate log (log.pkl) the target pose is
+estimated with the calibrated camera (PnP on the detected corners), the target
+corners are reprojected, and the frame is drawn with the detected corners
+(green), the reprojections (red) and the error vectors magnified by
+--error-scale (yellow). The pose is a per-frame fit with the final
+intrinsics, not the pose from the joint optimisation, so errors can be
+slightly smaller than in the calibration report.
+
+It also builds a heatmap of the mean reprojection error per pixel location
+over every frame it goes through: each detected corner adds its error to the
+pixel it was detected at, pixels without a measurement are linearly
+interpolated from those with one (nearest value outside their hull), and the
+heatmap is saved overlaid on the last frame the tool touched
+(reprojection_heatmap.png, data in reprojection_heatmap.npy).
+"""
+import argparse
+import math
+import os
+import sys
+
+import cv2
+import dill
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import griddata
+
+import kalibr_common as kc  # noqa: F401  (registers the pickled types)
+import kalibr_camera_calibration as kcc  # noqa: F401
+from tartan_logging import TartanLogging  # noqa: F401
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--obsfile', required=True, help='The tartan_calibrate log pickle (log.pkl).')
+    parser.add_argument('--obs-it', type=int, default=-1,
+                        help='Calibration iteration to use: observations and model (default: last).')
+    parser.add_argument('--cam-id', type=int, default=0, help='Camera index (default: %(default)s).')
+    parser.add_argument('--out', help='Folder to save <timestamp>_reprojection.png and errors.csv in.')
+    parser.add_argument('--show', action='store_true',
+                        help='Show the frames in a window (any key: next, p: previous, q/Esc: quit).')
+    parser.add_argument('--error-scale', type=float, default=20.0,
+                        help='Magnification of the drawn error vectors (default: %(default)s).')
+    parser.add_argument('--heatmap-bin', type=int, default=1,
+                        help='Average errors over NxN pixel cells for the heatmap; 1 is per pixel '
+                             '(default: %(default)s).')
+    parser.add_argument('--heatmap-alpha', type=float, default=0.55,
+                        help='Opacity of the heatmap over the frame (default: %(default)s).')
+    parser.add_argument('--no-heatmap', action='store_true', help='Do not build the error heatmap.')
+    parsed = parser.parse_args()
+    if parsed.heatmap_bin < 1:
+        parser.error('--heatmap-bin must be at least 1')
+    if not parsed.out and not parsed.show:
+        parser.error('nothing to do: pass --out and/or --show')
+    return parsed
+
+
+def to_point(xy):
+    return (int(round(xy[0])), int(round(xy[1])))
+
+
+def draw_frame(obs, geometry, error_scale):
+    image = np.asarray(obs.getImage())
+    canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if image.ndim == 2 else image.copy()
+    stamp = obs.time().toSec()
+
+    success, T_t_c = geometry.estimateTransformation(obs)
+    if not success:
+        cv2.putText(canvas, 'pose estimation failed', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 0, 255), 2)
+        return canvas, stamp, None, None
+    obs.set_T_t_c(T_t_c)
+    detected = np.asarray(obs.getCornersImageFrame())
+    reprojected = np.asarray(obs.getCornerReprojection(geometry))
+    errors = np.linalg.norm(detected - reprojected, axis=1)
+
+    for d, r in zip(detected, reprojected):
+        tip = d + error_scale * (r - d)
+        cv2.line(canvas, to_point(d), to_point(tip), (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(canvas, to_point(d), 4, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.drawMarker(canvas, to_point(r), (0, 0, 255), cv2.MARKER_CROSS, 7, 1, cv2.LINE_AA)
+
+    lines = ['t={0:.3f}s  corners={1}'.format(stamp, len(errors)),
+             'reproj err  mean {0:.3f}px  max {1:.3f}px'.format(errors.mean(), errors.max()),
+             'green=detected  red=reprojected  yellow=error x{0:g}'.format(error_scale)]
+    for k, text in enumerate(lines):
+        org = (12, 28 + 26 * k)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(canvas, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas, stamp, errors, detected
+
+
+def build_heatmap(points, errors, shape, bin_px):
+    """Mean error per bin_px x bin_px cell at full image resolution.
+
+    Cells without a measurement are interpolated linearly from the measured
+    cells (nearest measured value outside their convex hull).
+    Returns (heatmap HxW float32, number of measured cells, number of cells).
+    """
+    height, width = shape
+    rows, cols = int(math.ceil(height / float(bin_px))), int(math.ceil(width / float(bin_px)))
+    # corner (u, v) lies in pixel (round(v), round(u)); pixel centres are integers
+    c = np.clip(np.floor((points[:, 0] + 0.5) / bin_px).astype(int), 0, cols - 1)
+    r = np.clip(np.floor((points[:, 1] + 0.5) / bin_px).astype(int), 0, rows - 1)
+    sums = np.zeros((rows, cols))
+    counts = np.zeros((rows, cols))
+    np.add.at(sums, (r, c), errors)
+    np.add.at(counts, (r, c), 1)
+
+    measured = counts > 0
+    mr, mc = np.nonzero(measured)
+    values = sums[measured] / counts[measured]
+    grid_r, grid_c = np.mgrid[0:rows, 0:cols]
+    heat = np.full((rows, cols), np.nan)
+    heat[measured] = values
+    if len(values) >= 3:
+        heat = griddata((mr, mc), values, (grid_r, grid_c), method='linear')
+        heat[measured] = values
+    missing = np.isnan(heat)
+    if np.any(missing):
+        heat[missing] = griddata((mr, mc), values, (grid_r[missing], grid_c[missing]), method='nearest')
+
+    if bin_px > 1:
+        # cell values sit at cell centres; resample to pixels
+        u = (np.arange(width, dtype=np.float32) + 0.5) / bin_px - 0.5
+        v = (np.arange(height, dtype=np.float32) + 0.5) / bin_px - 0.5
+        uu, vv = np.meshgrid(u, v)
+        heat = cv2.remap(heat.astype(np.float32), uu, vv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return heat.astype(np.float32), int(measured.sum()), rows * cols
+
+
+def plot_heatmap(image, heat, title, alpha):
+    """Heatmap over the frame with a colour bar labelled with its min and max."""
+    height, width = heat.shape
+    fig_h = 9.0
+    fig, ax = plt.subplots(figsize=(fig_h * width / float(height) + 2.2, fig_h))
+    ax.imshow(image, cmap='gray', vmin=0, vmax=255, interpolation='nearest')
+    vmin, vmax = float(heat.min()), float(heat.max())
+    overlay = ax.imshow(heat, cmap='viridis', vmin=vmin, vmax=vmax, alpha=alpha, interpolation='nearest')
+    ax.set_title(title, fontsize=10)
+    ax.set_axis_off()
+    cbar = fig.colorbar(overlay, ax=ax, fraction=0.06, pad=0.02)
+    cbar.solids.set_alpha(1.0)
+    ticks = np.linspace(vmin, vmax, 6)
+    cbar.set_ticks(ticks)
+    labels = ['{0:.2f}'.format(t) for t in ticks]
+    labels[0] = 'min {0:.2f}'.format(vmin)
+    labels[-1] = 'max {0:.2f}'.format(vmax)
+    cbar.set_ticklabels(labels)
+    cbar.set_label('mean reprojection error [px]')
+    fig.tight_layout()
+    return fig
+
+
+def main():
+    parsed = parse_arguments()
+    with open(parsed.obsfile, 'rb') as f:
+        log = dill.load(f)
+    entry = log[parsed.obs_it]
+    geometry = entry.camera_[parsed.cam_id]
+    observations = [o for o in entry.ObservationDatabase_.observations[parsed.cam_id]
+                    if o.hasSuccessfulObservation()]
+    if not observations:
+        sys.exit('No successful observations for cam{0} in {1}'.format(parsed.cam_id, parsed.obsfile))
+    if np.asarray(observations[0].getImage()).size == 0:
+        sys.exit('The log does not contain the frame images.')
+    print('{0} frames, model {1}: {2}'.format(len(observations), type(geometry).__name__,
+                                               geometry.projection().getParameters().flatten()))
+
+    rows = []
+    if parsed.out and not os.path.isdir(parsed.out):
+        os.makedirs(parsed.out)
+    window = 'Corner reprojection (final calibration)'
+    if parsed.show:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        h, w = np.asarray(observations[0].getImage()).shape[:2]
+        fit = min(1.0, 1000.0 / h, 1600.0 / w)
+        cv2.resizeWindow(window, int(w * fit), int(h * fit))
+
+    idx, rendered, last_idx = 0, {}, 0
+    heat_points, heat_errors = [], []
+    while 0 <= idx < len(observations):
+        last_idx = idx
+        if idx not in rendered:
+            canvas, stamp, errors, detected = draw_frame(observations[idx], geometry, parsed.error_scale)
+            rendered[idx] = (canvas, stamp)
+            if errors is not None:
+                rows.append((stamp, len(errors), errors.mean(), np.median(errors), errors.max()))
+                heat_points.append(detected)
+                heat_errors.append(errors)
+            if parsed.out:
+                cv2.imwrite(os.path.join(parsed.out, '{0:.6f}_reprojection.png'.format(stamp)), canvas)
+        canvas = rendered[idx][0]
+        if parsed.show:
+            cv2.setWindowTitle(window, '{0} [{1}/{2}]'.format(window, idx + 1, len(observations)))
+            cv2.imshow(window, canvas)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord('q'), 27):
+                break
+            if key == ord('p'):
+                idx = max(0, idx - 1)
+                continue
+        idx += 1
+
+    if rows:
+        all_means = np.array([r[2] for r in rows])
+        worst = sorted(rows, key=lambda r: -r[2])[:5]
+        print('Per-frame mean reprojection error: median {0:.3f}px, max {1:.3f}px'.format(
+            np.median(all_means), all_means.max()))
+        print('Worst frames (t, mean px): ' + ', '.join('{0:.3f}s {1:.3f}'.format(r[0], r[2]) for r in worst))
+    if parsed.out:
+        with open(os.path.join(parsed.out, 'errors.csv'), 'w') as f:
+            f.write('timestamp_s,corners,mean_px,median_px,max_px\n')
+            for r in sorted(rows):
+                f.write('{0:.9f},{1},{2:.6f},{3:.6f},{4:.6f}\n'.format(*r))
+        print('Saved {0} frame(s) and errors.csv to {1}'.format(len(rendered), parsed.out))
+    if parsed.show:
+        cv2.destroyAllWindows()
+
+    if parsed.no_heatmap or not heat_errors:
+        return
+    image = np.asarray(observations[last_idx].getImage())
+    points = np.vstack(heat_points)
+    errors = np.concatenate(heat_errors)
+    heat, n_measured, n_cells = build_heatmap(points, errors, image.shape[:2], parsed.heatmap_bin)
+    cell = 'pixels' if parsed.heatmap_bin == 1 else '{0}x{0} px cells'.format(parsed.heatmap_bin)
+    print('Heatmap: {0} corners from {1} frames in {2} of {3} {4} ({5:.2f}%), the rest interpolated; '
+          'min {6:.3f}px, max {7:.3f}px'.format(len(errors), len(heat_errors), n_measured, n_cells, cell,
+                                                100.0 * n_measured / n_cells, heat.min(), heat.max()))
+    title = ('Mean reprojection error per {0} over {1} frames ({2} corners; {3} {4} measured, '
+             'rest interpolated)\nover frame t={5:.3f}s').format(
+                 'pixel' if parsed.heatmap_bin == 1 else '{0}x{0} px cell'.format(parsed.heatmap_bin),
+                 len(heat_errors), len(errors), n_measured, cell,
+                 observations[last_idx].time().toSec())
+    fig = plot_heatmap(image, heat, title, parsed.heatmap_alpha)
+    if parsed.out:
+        png = os.path.join(parsed.out, 'reprojection_heatmap.png')
+        fig.savefig(png, dpi=max(100, image.shape[0] / 9.0))
+        np.save(os.path.join(parsed.out, 'reprojection_heatmap.npy'), heat)
+        print('Saved {0} and reprojection_heatmap.npy'.format(png))
+    if parsed.show and matplotlib.get_backend().lower() != 'agg':
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

@@ -52,16 +52,24 @@ GridCalibrationTargetAprilgrid::GridCalibrationTargetAprilgrid() :
       _tagCodes(AprilTags::tagCodes36h11)
 {}
 
+/// \brief open the extraction windows on first use (not in the constructor,
+///        which also runs when a target is unpickled, e.g. from log.pkl on a
+///        machine without a display)
+static void showExtractionWindows()
+{
+  static bool sized = false;
+  cv::namedWindow("Aprilgrid: Tag detection", cv::WINDOW_NORMAL);
+  cv::namedWindow("Aprilgrid: Tag corners", cv::WINDOW_NORMAL);
+  if (!sized) {
+    cv::resizeWindow("Aprilgrid: Tag detection", 640, 480);
+    cv::resizeWindow("Aprilgrid: Tag corners", 640, 480);
+    sized = true;
+  }
+}
+
 /// \brief initialize the object
 void GridCalibrationTargetAprilgrid::initialize()
 {
-  if (_options.showExtractionVideo) {
-    cv::namedWindow("Aprilgrid: Tag detection", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Aprilgrid: Tag detection", 640, 480);
-    cv::namedWindow("Aprilgrid: Tag corners", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Aprilgrid: Tag corners", 640, 480);
-  }
-
   //create the tag detector
   _tagDetector = boost::make_shared<AprilTags::TagDetector>(_tagCodes, _options.blackTagBorder);
 }
@@ -221,6 +229,7 @@ bool GridCalibrationTargetAprilgrid::computeObservation(
         cv::TermCriteria(cv::TermCriteria::Type::EPS + cv::TermCriteria::Type::MAX_ITER, 30, 0.1));
 
   if (_options.showExtractionVideo) {
+    showExtractionWindows();
     //image with refined (blue) and raw corners (red)
     cv::Mat imageCopy1 = image.clone();
     cv::cvtColor(imageCopy1, imageCopy1, cv::COLOR_GRAY2RGB);

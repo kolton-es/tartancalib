@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-import roslib; roslib.load_manifest('bsplines'); 
 import bsplines
 import numpy
 import scipy.interpolate.fitpack as fp
@@ -673,7 +672,7 @@ class TestBSplines(BSplineTestCase):
                     for t in numpy.arange(aspl.t_min(),aspl.t_max(),0.1):
                         self.assertMatricesEqual(aspl.evalD(t,0),c,1e-15,"Error getting back the constant value")
 if __name__ == '__main__':
-    import rostest
-    rostest.rosrun('splines', 'bspline', TestBSplines)
+    import unittest
+    unittest.main()
     #tb = TestBSplines()
     #tb.test_constant_init()

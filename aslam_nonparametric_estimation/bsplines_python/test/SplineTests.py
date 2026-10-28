@@ -69,6 +69,6 @@ class TestSplinesVsFitpack(unittest.TestCase):
             
 
 if __name__ == '__main__':
-    import rostest
-    rostest.rosrun('splines', 'test_vs_fitpack', TestSplinesVsFitpack)
+    import unittest
+    unittest.main()
 
